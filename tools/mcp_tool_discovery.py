@@ -49,7 +49,32 @@ def _record_connect_failure(server_name: str) -> None:
     n = _core._server_connect_failures.get(key, 0) + 1
     _core._server_connect_failures[key] = n
     backoff = min(_core._CONNECT_RETRY_BASE_BACKOFF_SEC * (2 ** (n - 1)), _core._CONNECT_RETRY_MAX_BACKOFF_SEC)
-    _core._server_connect_retry_after[key] = time.monotonic() + backoff
+    _core._server_connect_retry_after[key] = max(
+        _core._server_connect_retry_after.get(key, 0), time.monotonic() + backoff)
+
+
+def _record_server_retry_after(server_name: str, delay: float) -> None:
+    """Keep the server's minimum retry deadline across discovery and replacement tasks."""
+    key = _server_key(server_name)
+    with _core._lock:
+        _core._server_connect_retry_after[key] = max(
+            _core._server_connect_retry_after.get(key, 0), time.monotonic() + delay)
+
+
+async def _wait_for_connect_cooldown(server_name: str, shutdown: asyncio.Event) -> bool:
+    """Discovery nudges may request reconnect, but cannot shorten a server's retry deadline."""
+    key = _server_key(server_name)
+    while True:
+        with _core._lock:
+            remaining = _core._server_connect_retry_after.get(key, 0) - time.monotonic()
+        if remaining <= 0:
+            return True
+        if shutdown.is_set():
+            return False
+        try:
+            await asyncio.wait_for(shutdown.wait(), timeout=remaining)
+        except TimeoutError:
+            continue
 
 
 def _clear_connect_failure(server_name: str) -> None:

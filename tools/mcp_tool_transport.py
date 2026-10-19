@@ -183,20 +183,28 @@ class MCPServerTransportMixin:
         ``.capabilities``). ``auto`` tries the legacy handshake FIRST, falling back to discover only
         on a modern-only signal (-32022 / initialize -32601) — the reverse of the SDK's discover-first
         mode, so handshake-era servers pay zero extra round-trips. ``stateless`` probes discover first
-        (one legacy retry on any error); ``legacy`` is handshake only. A TIMEOUT never falls back."""
+        (one legacy retry on protocol errors); ``legacy`` is handshake only. Timeouts, auth failures
+        and HTTP overload/outages never fall back."""
         def call(method: str):
+            self._http_rejection.clear()
             return asyncio.wait_for(getattr(session, method)(), timeout=connect_timeout)
 
         async def attempt(primary, fallback, should_fallback, log_fmt, *log_extra):
             try:
                 return await call(primary)
             except Exception as exc:
+                status = self._http_rejection.get("status", 0)
+                if status in (401, 403, 429) or status >= 500:
+                    raise
                 if isinstance(exc, asyncio.TimeoutError) or not should_fallback(exc):
                     raise
                 logger.info(log_fmt, self.name, exc, *log_extra)
                 try:
                     return await call(fallback)
                 except Exception as fallback_exc:
+                    status = self._http_rejection.get("status", 0)
+                    if status in (401, 403, 429) or status >= 500:
+                        raise
                     # #113359: the server ANSWERED ``initialize`` (200, valid result) but named a version the
                     # SDK's handshake refuses (e.g. 2026-07-28 echoed to a 2025-11-25 offer), and it has no
                     # ``server/discover`` either. The wire handshake succeeded, so complete it ourselves.
@@ -541,6 +549,7 @@ class MCPServerTransportMixin:
             inner_transport = _httpx_mod.AsyncHTTPTransport(verify=ssl_verify, **_present(cert=client_cert))
             return _httpx_mod.AsyncClient(
                 follow_redirects=True,
+                event_hooks={"response": [_make_http_rejection_recorder(self._http_rejection, self.name)]},
                 timeout=timeout if timeout is not None else _httpx_mod.Timeout(30.0, read=300.0),
                 transport=_make_mcp_body_cap_transport(_httpx_mod, inner_transport),
                 **_present(mounts=_mcp_proxy_mounts(_httpx_mod, url, ssl_verify, client_cert, self.name),
@@ -570,7 +579,7 @@ class MCPServerTransportMixin:
         inner_transport = httpx.AsyncHTTPTransport(verify=ssl_verify, **_present(cert=client_cert))
         client_kwargs: dict = {"follow_redirects": True, "timeout": httpx.Timeout(float(connect_timeout), read=300.0),
                                **({"headers": headers} if headers else {}),
-                               "event_hooks": {"response": [_make_http_rejection_recorder(self._http_rejection)]},
+                               "event_hooks": {"response": [_make_http_rejection_recorder(self._http_rejection, self.name)]},
                                "transport": _make_mcp_body_cap_transport(httpx, inner_transport),
                                **_present(mounts=_mcp_proxy_mounts(httpx, url, ssl_verify, client_cert, self.name),
                                           auth=oauth_auth)}
@@ -584,6 +593,9 @@ class MCPServerTransportMixin:
 
     async def _run_http(self, config: dict):
         """Run the server using HTTP/StreamableHTTP (or SSE) transport."""
+        from tools.mcp_tool_discovery import _wait_for_connect_cooldown
+        if not await _wait_for_connect_cooldown(self.name, self._shutdown_event):
+            return "shutdown"
         _core._ensure_mcp_sdk()
         if not _core._MCP_HTTP_AVAILABLE:
             raise ImportError(f"MCP server '{self.name}' requires HTTP transport but "
@@ -629,7 +641,7 @@ class MCPServerTransportMixin:
             # transport must not silently switch transports), never on a timeout (not a
             # transport mismatch — ``_is_streamable_http_rejection`` matches neither), and never
             # with ``strict_redirect_headers`` (SSE cannot enforce that boundary).
-            if (self._ever_connected or common[-1] or not _is_streamable_http_rejection(exc)):
+            if (self._ever_connected or common[-1] or not _is_streamable_http_rejection(exc, self._http_rejection)):
                 if http_detail != str(_unwrap_exception_group(exc)):  # opaque SDK error + a recorded rejection
                     raise ConnectionError(f"MCP server '{self.name}': Streamable HTTP connect failed "
                                           f"({http_detail})") from exc

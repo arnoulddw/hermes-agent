@@ -7,8 +7,11 @@ import contextlib
 import errno
 import importlib
 import logging
+import math
 import os
 import re
+import time
+from email.utils import parsedate_to_datetime
 from typing import Any, List, Optional
 from urllib.parse import urlparse
 from tools.mcp_tool_common import _exc_str, _sanitize_error, _core
@@ -76,7 +79,7 @@ class NonMcpEndpointError(ConnectionError):
 _STREAMABLE_REJECT_STATUSES = (400, 405, 406, 411)
 
 
-def _is_streamable_http_rejection(exc: BaseException) -> bool:
+def _is_streamable_http_rejection(exc: BaseException, rejection: Optional[dict] = None) -> bool:
     """True when a Streamable-HTTP connect failure looks like a transport mismatch rather than a
     broken server: a 400-family rejection of the initialize POST, or the SDK's opaque INTERNAL_ERROR
     (-32603 ``Server returned an error response``) it maps such rejections to on mcp >= 2.0 (error
@@ -84,16 +87,33 @@ def _is_streamable_http_rejection(exc: BaseException) -> bool:
     these markers — so a slow or 401ing server is not retried on the wrong transport.
     """
     root = _unwrap_exception_group(exc)
-    if getattr(getattr(root, "response", None), "status_code", None) in _STREAMABLE_REJECT_STATUSES:
-        return True
+    if isinstance(root, (TimeoutError, asyncio.CancelledError)):
+        return False
     code = getattr(getattr(root, "error", None), "code", None)
-    return code == -32603 and "server returned an error response" in str(root).lower()
+    opaque = code == -32603 and "server returned an error response" in str(root).lower()
+    status = getattr(getattr(root, "response", None), "status_code", None)
+    if status is None and opaque:
+        status = (rejection or {}).get("status")
+    if status is not None:
+        # A known auth/overload/outage status overrides the SDK's opaque -32603 wrapper.
+        return status in _STREAMABLE_REJECT_STATUSES
+    return opaque
 
 
 _HTTP_REJECTION_BODY_CHARS = 300
 
 
-def _make_http_rejection_recorder(sink: dict):
+def _retry_after_seconds(value: str) -> Optional[float]:
+    """Parse RFC Retry-After delta-seconds or an HTTP date; invalid headers do not alter backoff."""
+    try:
+        value = value.strip()
+        delay = float(value) if value.isascii() and value.isdecimal() else parsedate_to_datetime(value).timestamp() - time.time()
+        return max(0.0, delay) if math.isfinite(delay) else None
+    except (ValueError, TypeError, OverflowError):
+        return None
+
+
+def _make_http_rejection_recorder(sink: dict, server_name: Optional[str] = None):
     """httpx response hook for the owned Streamable HTTP client: remembers the last 4xx/5xx the server
     sent (status, method, URL, head of the body). mcp >= 2.0 folds a non-2xx whose body it cannot
     parse as a JSON-RPC error into the opaque ``-32603 Server returned an error response`` — the
@@ -113,6 +133,14 @@ def _make_http_rejection_recorder(sink: dict):
                 body = ""
         sink.update(status=response.status_code, method=response.request.method,
                     url=str(response.request.url), body=body[:_HTTP_REJECTION_BODY_CHARS])
+        sink.pop("retry_after", None)
+        if response.status_code in (429, 503):
+            delay = _retry_after_seconds(response.headers.get("retry-after", ""))
+            if delay is not None:
+                sink["retry_after"] = delay
+                if server_name is not None:
+                    from tools.mcp_tool_discovery import _record_server_retry_after
+                    _record_server_retry_after(server_name, delay)
 
     return _record
 
