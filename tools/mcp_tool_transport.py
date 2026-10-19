@@ -577,9 +577,18 @@ class MCPServerTransportMixin:
         # verify/cert live on the inner transport: a custom transport= makes client-level TLS kwargs
         # inert — and suppresses httpx's own proxy auto-detection, hence the explicit mounts=.
         inner_transport = httpx.AsyncHTTPTransport(verify=ssl_verify, **_present(cert=client_cert))
+        async def _prepare_request(request):
+            # SDK 2.x stamps JSON on bodyless session-close DELETEs. Strict JSON servers
+            # reject these before their MCP handler can release the session slot.
+            if (request.method == "DELETE"
+                    and request.headers.get("content-length", "0") == "0"
+                    and "transfer-encoding" not in request.headers
+                    and request.headers.get("content-type", "").split(";")[0].strip().lower() == "application/json"):
+                del request.headers["content-type"]
         client_kwargs: dict = {"follow_redirects": True, "timeout": httpx.Timeout(float(connect_timeout), read=300.0),
                                **({"headers": headers} if headers else {}),
-                               "event_hooks": {"response": [_make_http_rejection_recorder(self._http_rejection, self.name)]},
+                               "event_hooks": {"request": [_prepare_request],
+                                               "response": [_make_http_rejection_recorder(self._http_rejection, self.name)]},
                                "transport": _make_mcp_body_cap_transport(httpx, inner_transport),
                                **_present(mounts=_mcp_proxy_mounts(httpx, url, ssl_verify, client_cert, self.name),
                                           auth=oauth_auth)}
